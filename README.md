@@ -1,6 +1,6 @@
 # Minitracker
 
-Séquenceur pas à pas pour la carte **Minitel Wifi V2** (ESP32-WROOM-32) : on compose une boucle de 16 pas sur 4 pistes mélodiques et 2 pistes de batterie au clavier du Minitel, et le son sort sur une enceinte Bluetooth.
+Séquenceur pas à pas pour la carte [**Minitel Wifi V2**](https://github.com/MemoireMorte/Esp32-Minitel-dev-kit) : on compose une boucle de 16 pas sur 4 pistes mélodiques et 2 pistes de batterie au clavier du Minitel, et le son sort sur une enceinte Bluetooth.
 
 Tout le programme tient dans `minitracker.ino`.
 
