@@ -1,6 +1,6 @@
-# Séquenceur Minitel → enceinte Bluetooth
+# Minitracker
 
-Séquenceur pas à pas pour la carte **Minitel Wifi V2** (ESP32-WROOM-32) : on compose une boucle de 16 pas sur 4 pistes au clavier du Minitel, et le son sort sur une enceinte Bluetooth.
+Séquenceur pas à pas pour la carte **Minitel Wifi V2** (ESP32-WROOM-32) : on compose une boucle de 16 pas sur 4 pistes mélodiques et 2 pistes de batterie au clavier du Minitel, et le son sort sur une enceinte Bluetooth.
 
 Tout le programme tient dans `minitracker.ino`.
 
@@ -21,7 +21,7 @@ Pour changer d'enceinte : **Sommaire**, puis **Annulation**. Sauvegardez d'abord
 
 ## La grille
 
-Les pas défilent de haut en bas, une colonne par piste. Les numéros des pas 1, 5, 9 et 13 (les temps) sont en vidéo inverse. Au-dessus de la grille, la ligne `ONDE` donne la forme d'onde de chaque piste (et l'octave courante), la ligne `VOL` son volume.
+Les pas défilent de haut en bas, une colonne par piste. Les numéros des pas 1, 5, 9 et 13 (les temps) sont en vidéo inverse. Les colonnes `P1` à `P4` sont les pistes mélodiques, `D1` et `D2` les pistes de batterie. Au-dessus de la grille, la ligne `ONDE` donne la forme d'onde de chaque piste mélodique et la ligne `VOL` le volume de chacune des six pistes. Le bandeau affiche la boucle en cours, le tempo et l'octave courante.
 
 | Touche | Action |
 |---|---|
@@ -32,6 +32,7 @@ Les pas défilent de haut en bas, une colonne par piste. Les numéros des pas 1,
 | Espace ou **Correction** | Vider la case |
 | `+` et `-` | Volume de la piste sous le curseur (0 = muette, 9 = maximum) |
 | `*` | Forme d'onde de la piste sous le curseur : `CAR` carrée, `SCI` dent de scie, `TRI` triangle, `SIN` sinus |
+| `K` `G` `N` `C` `O` `T` | Sur les pistes `D1` et `D2` : kick (`KIK`), kick gabber (`GAB`), caisse claire (`SNR`), hi-hat fermé (`CHH`), hi-hat ouvert (`OHH`), tom (`TOM`) |
 | **Envoi** | Lancer / arrêter la lecture en boucle |
 | `S` | Sauver la boucle dans son emplacement d'origine |
 | **Suite** / **Retour** | Tempo +5 / −5 BPM (60 à 200) |
@@ -39,7 +40,7 @@ Les pas défilent de haut en bas, une colonne par piste. Les numéros des pas 1,
 | **Guide** | Écran d'aide |
 | **Sommaire** | Boucles sauvegardées et enceinte |
 
-À l'arrêt, chaque note posée est jouée une fois.
+À l'arrêt, chaque note ou son de batterie posé est joué une fois.
 
 ## Boucles et sauvegarde
 
@@ -47,7 +48,7 @@ La boucle affichée dans la grille est une copie de travail : **rien n'est sauve
 
 Dans la grille, `S` sauve directement dans l'emplacement d'origine et l'étoile disparaît. Si la boucle n'a encore jamais été sauvée, `S` ouvre le sommaire et demande dans quel emplacement l'enregistrer.
 
-L'écran **Sommaire** liste 9 emplacements, avec pour chacun son tempo et une frise des pas qui contiennent des notes.
+L'écran **Sommaire** liste 9 emplacements, avec pour chacun son tempo et une frise des pas qui contiennent au moins une note ou un son de batterie.
 
 | Touche (écran Sommaire) | Action |
 |---|---|
@@ -60,7 +61,8 @@ L'écran **Sommaire** liste 9 emplacements, avec pour chacun son tempo et une fr
 - **Confirmations** : il faut retaper le chiffre pour écraser un emplacement déjà occupé par une autre boucle, ou pour charger une boucle alors que la boucle en cours a des modifications non sauvées.
 - **Libérer un emplacement** : sauver une grille vide (sans aucune note) dans un emplacement le libère. Depuis la grille : **Annulation** deux fois pour tout vider, puis **Sommaire**, `S` et le chiffre.
 - Au démarrage, la carte recharge le dernier emplacement chargé ou sauvé.
-- Chaque boucle garde sa grille, son tempo, ses volumes et ses formes d'onde.
+- Chaque boucle garde sa grille, sa batterie, son tempo, ses volumes et ses formes d'onde.
+- Les boucles sauvées avant l'ajout des pistes de batterie restent lisibles ; elles se chargent avec les pistes manquantes vides.
 
 ## Réglages dans le code
 
@@ -68,11 +70,14 @@ L'écran **Sommaire** liste 9 emplacements, avec pour chacun son tempo et une fr
 |---|---|
 | `VOLUME_BT` | Volume général envoyé à l'enceinte (0 à 127) |
 | `AMPLITUDE` | Niveau d'une voix avant mixage |
+| `NIVEAU_BATTERIE` | Niveau général de la batterie par rapport aux pistes mélodiques |
+| `GABBER_NIVEAU`, `GABBER_SATURATION` | Niveau et saturation du kick gabber |
 | `RETARD_AFFICHAGE_MS` | Retard du repère de lecture, pour compenser la latence de l'enceinte |
 | `DEBUG_TOUCHES` | À 1, affiche le code de chaque touche sur le moniteur série |
 
 ## Limites connues
 
+- Les deux pistes de batterie partagent les mêmes voix : le même son posé sur le même pas des deux pistes ne joue qu'une fois, au volume de `D2`.
 - La latence du Bluetooth (100 à 300 ms) interdit le jeu en direct : c'est un séquenceur, pas un clavier.
 - Les petites enceintes restituent mal les notes graves ; monter la basse d'une octave aide plus que le volume.
 - À 1200 bauds (Minitel 1), le repère de lecture saute un pas sur deux au-delà de 135 BPM.
@@ -85,5 +90,6 @@ L'écran **Sommaire** liste 9 emplacements, avec pour chacun son tempo et une fr
 - **Vitesse** : le croquis passe le Minitel à 4800 bauds quand il l'accepte (1B et suivants), puis vérifie la vitesse réelle.
 - **Clavier** : les flèches ne sont transmises qu'en mode clavier étendu (`extendedKeyboard()`).
 - **Appairage** : la bibliothèque appelle une fonction pour chaque appareil audio trouvé ; on y remplit la liste et on n'accepte que l'adresse choisie. Changer d'enceinte passe par un redémarrage, plus fiable qu'une déconnexion à chaud.
-- **Sauvegarde** : `Preferences` (mémoire flash), espace de noms `seq-bt`, clés `b1` à `b9` (74 octets par boucle). Les 9 emplacements sont copiés en mémoire vive au démarrage : charger une boucle ne lit pas la flash, et l'échange se fait dans le rappel audio, au premier pas du tour.
+- **Batterie** : sons calculés, sans échantillons. Kick et tom sont des sinus dont la fréquence glisse vers le grave ; le kick gabber part de plus haut, dure plus longtemps et passe dans une forte saturation (`GABBER_SATURATION`, `GABBER_NIVEAU`) ; la caisse claire mêle bruit blanc et un ton court ; les hi-hats sont du bruit filtré passe-haut, avec un déclin court ou long. Chaque son a sa propre voix et peut résonner sous le suivant ; les deux pistes servent à superposer deux sons différents sur un même pas.
+- **Sauvegarde** : `Preferences` (mémoire flash), espace de noms `seq-bt` (nom d'origine du projet, conservé pour ne pas perdre les boucles existantes), clés `b1` à `b9` (108 octets par boucle ; les formats antérieurs de 74 et 92 octets restent lus). Les 9 emplacements sont copiés en mémoire vive au démarrage : charger une boucle ne lit pas la flash, et l'échange se fait dans le rappel audio, au premier pas du tour.
 

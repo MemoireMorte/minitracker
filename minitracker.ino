@@ -1,8 +1,9 @@
-// Sequenceur Minitel -> enceinte Bluetooth
+// Minitracker
 //
 // Sequenceur pas a pas pour la carte Minitel Wifi V2 (ESP32-WROOM-32) :
-// grille de 16 pas x 4 pistes editee au clavier du Minitel, lecture en boucle
-// sur une enceinte Bluetooth (A2DP) appairee depuis le Minitel.
+// grille de 16 pas, 4 pistes melodiques et 2 pistes de batterie, editee au
+// clavier du Minitel, lecture en boucle sur une enceinte Bluetooth (A2DP)
+// appairee depuis le Minitel.
 // Mode d'emploi et notes de conception : README.md
 //
 // Bibliotheques : ESP32-A2DP, Minitel1B_Hard
@@ -12,7 +13,9 @@
 #include <Minitel1B_Hard.h>
 #include "BluetoothA2DPSource.h"
 
-struct Boucle;   // definie plus bas ; declaree ici pour les prototypes generes par l'IDE
+// Types definis plus bas ; declares ici pour les prototypes generes par l'IDE.
+struct Boucle;
+struct Tonal;
 
 // ---- Reglages --------------------------------------------------------------
 const uint8_t VOLUME_BT = 60;      // 0 a 127
@@ -22,8 +25,11 @@ volatile uint16_t tempoBpm = 120;
 // La basse (P4) est renforcee par defaut.
 uint8_t niveauPiste[4] = { 5, 4, 4, 8 };
 volatile float volumePiste[4];
+uint8_t niveauBatterie[2] = { 6, 6 };  // volume des 2 pistes de batterie, 0 a 9
+volatile float volumeBatterie[2];
 void appliquerVolumes() {
   for (int p = 0; p < 4; p++) volumePiste[p] = niveauPiste[p] / 6.0f;
+  for (int b = 0; b < 2; b++) volumeBatterie[b] = niveauBatterie[b] / 6.0f;
 }
 
 // Forme d'onde de chaque piste. Reglable au clavier (touche *).
@@ -38,7 +44,10 @@ volatile uint8_t formePiste[4] = { ONDE_CARREE, ONDE_CARREE, ONDE_CARREE, ONDE_C
 const int   LED_PIN        = 13;
 const float FREQ_ECHANT_HZ = 44100.0f;
 const int   NB_PAS         = 16;
-const int   NB_PISTES      = 4;
+const int   NB_PISTES      = 4;              // pistes melodiques
+const int   NB_BATTERIES   = 2;              // pistes de batterie
+const int   NB_COLONNES    = NB_PISTES + NB_BATTERIES;  // colonnes de la grille
+const int   COL_BATTERIE   = NB_PISTES;      // premiere colonne de batterie
 
 Minitel             minitel(Serial2, 16, 17);
 BluetoothA2DPSource a2dp;
@@ -108,6 +117,111 @@ inline uint32_t echantillonsParPas() {
   return (uint32_t)(FREQ_ECHANT_HZ * 60.0f / (tempoBpm * 4.0f));
 }
 
+// ---- Batterie synthetique ---------------------------------------------------
+//
+// Deux pistes, un son par pas et par piste. Les sons sont calcules, sans
+// echantillons : sinus a frequence glissante pour les kicks et le tom, bruit
+// blanc pour la caisse claire, bruit filtre passe-haut pour les hi-hats.
+// Les deux pistes declenchent les memes voix (une par son) : elles servent a
+// superposer deux sons differents sur un meme pas. Chaque voix retient le
+// volume de la piste qui l'a declenchee.
+
+// Les valeurs sont enregistrees dans les boucles : ajouter a la fin seulement.
+enum : uint8_t { BAT_VIDE, BAT_KICK, BAT_SNARE, BAT_HAT, BAT_OPEN, BAT_TOM, BAT_GABBER, NB_BAT };
+const char* const NOM_BAT[NB_BAT] = { "---", "KIK", "SNR", "CHH", "OHH", "TOM", "GAB" };
+
+// Motif de batterie accompagnant le motif de test.
+volatile uint8_t batterie[NB_BATTERIES][NB_PAS] = {
+  { BAT_KICK,  BAT_VIDE, BAT_VIDE, BAT_VIDE,      // D1 : kicks et caisse claire
+    BAT_SNARE, BAT_VIDE, BAT_VIDE, BAT_VIDE,
+    BAT_KICK,  BAT_VIDE, BAT_VIDE, BAT_KICK,
+    BAT_SNARE, BAT_VIDE, BAT_VIDE, BAT_VIDE },
+  { BAT_HAT,   BAT_VIDE, BAT_HAT,  BAT_VIDE,      // D2 : hi-hats
+    BAT_HAT,   BAT_VIDE, BAT_HAT,  BAT_VIDE,
+    BAT_HAT,   BAT_VIDE, BAT_HAT,  BAT_VIDE,
+    BAT_HAT,   BAT_VIDE, BAT_OPEN, BAT_VIDE },
+};
+
+// Son "tonal" : un sinus dont la frequence glisse de freq vers freqFin.
+struct Tonal {
+  uint32_t phase;
+  float    freq, freqFin, glisse;   // glisse : rapprochement par echantillon
+  float    env, declin;             // enveloppe et son coefficient de declin
+  float    gain;                    // volume de la piste qui a declenche le son
+};
+Tonal kick   = { 0, 0, 0, 0, 0, 0, 0 };
+Tonal tom    = { 0, 0, 0, 0, 0, 0, 0 };
+Tonal gabber = { 0, 0, 0, 0, 0, 0, 0 };
+
+// Kick gabber : sinus glissant de tres haut, tenu longtemps, puis ecrase par
+// une forte saturation qui le rapproche d'une onde carree.
+const float GABBER_SATURATION = 9.0f;    // plus c'est grand, plus c'est sale
+const float GABBER_NIVEAU     = 0.9f;    // niveau de sortie, les autres sons sont vers 1
+
+// Niveau general de la batterie par rapport aux pistes melodiques.
+const float NIVEAU_BATTERIE   = 3.0f;
+
+float    envBruitCaisse = 0.0f, envTonCaisse = 0.0f, gainCaisse = 0.0f;
+uint32_t phaseCaisse    = 0;
+float    envCharley     = 0.0f, declinCharley = 0.9985f, bruitPrecedent = 0.0f;
+float    gainCharley    = 0.0f;
+uint32_t graineBruit    = 0x2545F491u;
+
+inline float bruitBlanc() {              // generateur xorshift, -1 a +1
+  graineBruit ^= graineBruit << 13;
+  graineBruit ^= graineBruit >> 17;
+  graineBruit ^= graineBruit << 5;
+  return (int32_t)graineBruit * (1.0f / 2147483648.0f);
+}
+
+// gain : volume de la piste qui declenche le son.
+void declencherBatterie(uint8_t son, float gain) {
+  switch (son) {
+    case BAT_KICK:   kick   = { 0, 160.0f,  52.0f, 0.9988f,  1.0f, 0.99977f, gain }; break;
+    case BAT_TOM:    tom    = { 0, 220.0f, 110.0f, 0.9993f,  1.0f, 0.99975f, gain }; break;
+    case BAT_GABBER: gabber = { 0, 420.0f,  58.0f, 0.99915f, 1.0f, 0.99986f, gain }; break;
+    case BAT_SNARE:  envBruitCaisse = 1.0f; envTonCaisse = 1.0f; phaseCaisse = 0;
+                     gainCaisse = gain; break;
+    case BAT_HAT:    envCharley = 1.0f; declinCharley = 0.9985f;  gainCharley = gain; break;  // ferme : ~15 ms
+    case BAT_OPEN:   envCharley = 1.0f; declinCharley = 0.99981f; gainCharley = gain; break;  // ouvert : ~120 ms
+  }
+}
+
+inline float echantillonTonal(Tonal& t) {
+  if (t.env < SEUIL_SILENCE) return 0.0f;
+  t.freq = t.freqFin + (t.freq - t.freqFin) * t.glisse;
+  t.phase += (uint32_t)(t.freq * (4294967296.0f / FREQ_ECHANT_HZ));
+  float s = tableSinus[t.phase >> 22] * t.env;
+  t.env *= t.declin;
+  return s;
+}
+
+inline float echantillonBatterie() {
+  float s = echantillonTonal(kick) * 1.6f * kick.gain
+          + echantillonTonal(tom)  * 1.2f * tom.gain;
+
+  if (gabber.env >= SEUIL_SILENCE) {               // kick gabber : sinus sature
+    float g = echantillonTonal(gabber) * GABBER_SATURATION;
+    g = g / (1.0f + fabsf(g));                     // ecretage doux, reste entre -1 et +1
+    s += g * GABBER_NIVEAU * gabber.gain;
+  }
+
+  if (envBruitCaisse > SEUIL_SILENCE) {            // caisse claire : bruit + un peu de ton
+    phaseCaisse += (uint32_t)(190.0f * (4294967296.0f / FREQ_ECHANT_HZ));
+    s += (bruitBlanc() * envBruitCaisse * 0.8f
+          + tableSinus[phaseCaisse >> 22] * envTonCaisse * 0.6f) * gainCaisse;
+    envBruitCaisse *= 0.99962f;
+    envTonCaisse   *= 0.99943f;
+  }
+  if (envCharley > SEUIL_SILENCE) {                // charley : bruit passe-haut
+    float b = bruitBlanc();
+    s += (b - bruitPrecedent) * 0.35f * envCharley * gainCharley;
+    bruitPrecedent = b;
+    envCharley *= declinCharley;
+  }
+  return s;
+}
+
 inline void declencherPas(uint8_t pas) {
   for (int p = 0; p < NB_PISTES; p++) {
     uint8_t note = grille[pas][p];
@@ -115,6 +229,8 @@ inline void declencherPas(uint8_t pas) {
     voix[p].increment = incrementNote[note & 0x7F];
     voix[p].cible = 1.0f;
   }
+  for (int b = 0; b < NB_BATTERIES; b++)
+    if (batterie[b][pas]) declencherBatterie(batterie[b][pas], volumeBatterie[b]);
   pasCourant = pas;
 }
 
@@ -129,7 +245,17 @@ struct Boucle {
   uint16_t tempo;
   uint8_t  volume[4];
   uint8_t  onde[4];
+  // Ajoutes ensuite, toujours a la fin : une boucle plus ancienne n'a que le
+  // debut de la structure et se relit avec les pistes manquantes vides.
+  uint8_t  batterie[NB_PAS];        // piste D1 (format 2)
+  uint8_t  volumeBatterie;
+  uint8_t  batterie2[NB_PAS];       // piste D2 (format 3)
+  uint8_t  volumeBatterie2;
 };
+const size_t TAILLE_BOUCLE_V1 = 74;   // sans batterie
+const size_t TAILLE_BOUCLE_V2 = 92;   // une piste de batterie
+
+int octaveCourante = 4;                    // octave donnee aux nouvelles notes
 
 const int NB_EMPLACEMENTS = 9;
 Boucle emplacements[NB_EMPLACEMENTS];      // copie en memoire vive de la flash
@@ -149,6 +275,10 @@ void capturerBoucle(Boucle& b) {
   memcpy(b.grille, (const void*)grille, sizeof(b.grille));
   b.tempo = tempoBpm;
   for (int p = 0; p < 4; p++) { b.volume[p] = niveauPiste[p]; b.onde[p] = formePiste[p]; }
+  memcpy(b.batterie,  (const void*)batterie[0], sizeof(b.batterie));
+  memcpy(b.batterie2, (const void*)batterie[1], sizeof(b.batterie2));
+  b.volumeBatterie  = niveauBatterie[0];
+  b.volumeBatterie2 = niveauBatterie[1];
 }
 
 void appliquerBoucle(const Boucle& b) {
@@ -158,6 +288,13 @@ void appliquerBoucle(const Boucle& b) {
     niveauPiste[p] = b.volume[p] <= 9 ? b.volume[p] : 9;
     formePiste[p]  = b.onde[p] < NB_ONDES ? b.onde[p] : ONDE_CARREE;
   }
+  for (int pas = 0; pas < NB_PAS; pas++)
+  {
+    batterie[0][pas] = b.batterie[pas]  < NB_BAT ? b.batterie[pas]  : BAT_VIDE;
+    batterie[1][pas] = b.batterie2[pas] < NB_BAT ? b.batterie2[pas] : BAT_VIDE;
+  }
+  niveauBatterie[0] = b.volumeBatterie  <= 9 ? b.volumeBatterie  : 9;
+  niveauBatterie[1] = b.volumeBatterie2 <= 9 ? b.volumeBatterie2 : 9;
   appliquerVolumes();
 }
 
@@ -192,6 +329,8 @@ int32_t produireAudio(Frame* trames, int32_t nb) {
       v.phase += v.increment;
       somme += echantillonOnde(formePiste[p], v.phase) * v.niveau * volumePiste[p];
     }
+
+    somme += echantillonBatterie() * NIVEAU_BATTERIE;   // volumes de piste deja appliques
 
     float s = somme * AMPLITUDE;
     if (s > 32767.0f)  s = 32767.0f;      // ecretage de securite
@@ -343,6 +482,7 @@ void friseBoucle(const Boucle& b, char* dest) {
   for (int pas = 0; pas < NB_PAS; pas++) {
     bool note = false;
     for (int p = 0; p < NB_PISTES; p++) if (b.grille[pas * NB_PISTES + p]) note = true;
+    if (b.batterie[pas] || b.batterie2[pas]) note = true;
     dest[pas] = note ? '#' : '.';
   }
   dest[NB_PAS] = 0;
@@ -399,10 +539,10 @@ void texteNote(uint8_t note, char* dest) {
 void afficherBandeauGrille() {
   char buf[41];
   // "BOUCLE 3*" : emplacement courant, etoile si modifiee depuis la sauvegarde
-  snprintf(buf, sizeof(buf), "BOUCLE %c%c      %3u BPM      %s",
+  snprintf(buf, sizeof(buf), "BOUCLE %c%c  %3u BPM  OCT %d  %s",
            emplacementCourant ? '0' + emplacementCourant : '-',
            modifie ? '*' : ' ',
-           tempoBpm, lecture ? "LECTURE" : "ARRET  ");
+           tempoBpm, octaveCourante, lecture ? "LECTURE" : "ARRET  ");
   bandeau(buf);
 }
 
@@ -415,12 +555,16 @@ void marquerModifie() {
 }
 
 int curPas = 0, curPiste = 0;   // case sous le curseur
-int octaveCourante = 4;         // octave donnee aux nouvelles notes
 
 // Dessine une case ; celle du curseur est en video inverse.
 void afficherCase(int pas, int piste) {
   char t[4];
-  texteNote(grille[pas][piste], t);
+  if (piste >= COL_BATTERIE) {
+    uint8_t son = batterie[piste - COL_BATTERIE][pas];
+    strcpy(t, NOM_BAT[son < NB_BAT ? son : 0]);
+  } else {
+    texteNote(grille[pas][piste], t);
+  }
   bool curseur = (pas == curPas && piste == curPiste);
   aller(xPiste(piste), Y_GRILLE + pas);
   if (curseur) minitel.attributs(INVERSION_FOND);
@@ -430,16 +574,17 @@ void afficherCase(int pas, int piste) {
 
 void afficherLigneEtat() {
   char buf[41];
-  snprintf(buf, sizeof(buf), "  ONDE %s   %s   %s   %s   Oct %d",
+  snprintf(buf, sizeof(buf), "  ONDE %s   %s   %s   %s",
            NOM_ONDE[formePiste[0]], NOM_ONDE[formePiste[1]],
-           NOM_ONDE[formePiste[2]], NOM_ONDE[formePiste[3]], octaveCourante);
+           NOM_ONDE[formePiste[2]], NOM_ONDE[formePiste[3]]);
   ligne(2, buf);
 }
 
 void afficherVolumes() {
   char buf[41];
-  snprintf(buf, sizeof(buf), "  VOL  %d     %d     %d     %d",
-           niveauPiste[0], niveauPiste[1], niveauPiste[2], niveauPiste[3]);
+  snprintf(buf, sizeof(buf), "  VOL  %d     %d     %d     %d     %d     %d",
+           niveauPiste[0], niveauPiste[1], niveauPiste[2], niveauPiste[3],
+           niveauBatterie[0], niveauBatterie[1]);
   ligne(3, buf);
 }
 
@@ -453,7 +598,7 @@ void afficherLignePas(int pas) {
   minitel.print(num);
   if (pas % 4 == 0) minitel.attributs(FOND_NORMAL);
 
-  for (int p = 0; p < NB_PISTES; p++) afficherCase(pas, p);
+  for (int p = 0; p < NB_COLONNES; p++) afficherCase(pas, p);
 }
 
 int reperePose = -1;   // pas ou le repere ">" est actuellement dessine
@@ -489,9 +634,9 @@ void ecranGrille() {
   afficherBandeauGrille();
   afficherLigneEtat();
   afficherVolumes();
-  ligne(4, "  PAS  P1    P2    P3    P4");
+  ligne(4, "  PAS  P1    P2    P3    P4    D1    D2");
   for (int pas = 0; pas < NB_PAS; pas++) afficherLignePas(pas);
-  ligne(22, "A-G note  # diese  1-7 octave");
+  ligne(22, "A-G # 1-7 notes   D1 D2: K G N C O T");
   ligne(23, "+/- volume  * onde  ESPACE vider");
   ligne(24, "ENVOI lecture  S sauver  GUIDE aide");
   reperePose = -1;
@@ -515,10 +660,13 @@ void ecranAide() {
   ligne(14, "S           sauver la boucle");
   ligne(15, "ANNULATION  deux fois : tout vider");
   ligne(16, "SOMMAIRE    boucles et enceinte");
-  ligne(18, "Ondes : CARree, dent de SCIe,");
-  ligne(19, "TRIangle, SINus.");
-  ligne(21, "Rien n'est sauve sans la touche S.");
-  ligne(23, "Une touche pour revenir a la grille");
+  ligne(17, "Pistes D1 D2 : K kick  G kick gabber");
+  ligne(18, " N snare  T tom  C hi-hat ferme (CHH)");
+  ligne(19, " O hi-hat ouvert (OHH)");
+  ligne(20, "Ondes : CARree, dent de SCIe,");
+  ligne(21, "TRIangle, SINus.");
+  ligne(22, "Rien n'est sauve sans la touche S.");
+  ligne(24, "Une touche pour revenir a la grille");
 }
 
 // ---- Edition de la grille --------------------------------------------------
@@ -548,11 +696,42 @@ int demiTonLettre(unsigned long touche) {
   return -1;
 }
 
+bool estFleche(unsigned long touche) {
+  return touche == TOUCHE_FLECHE_HAUT || touche == TOUCHE_FLECHE_BAS ||
+         touche == TOUCHE_FLECHE_GAUCHE || touche == TOUCHE_FLECHE_DROITE ||
+         (touche >= 0x08 && touche <= 0x0B);
+}
+
+// Saisie sur une piste de batterie : une lettre par son.
+void toucheBatterie(unsigned long touche) {
+  int b = curPiste - COL_BATTERIE;         // 0 = D1, 1 = D2
+  uint8_t ancien = batterie[b][curPas];
+  uint8_t nouveau;
+  switch (touche) {
+    case 'k': case 'K': nouveau = BAT_KICK;  break;
+    case 'g': case 'G': nouveau = BAT_GABBER; break;
+    case 'n': case 'N': nouveau = BAT_SNARE; break;
+    case 'c': case 'C': nouveau = BAT_HAT;   break;   // closed hi-hat
+    case 'o': case 'O': nouveau = BAT_OPEN;  break;   // open hi-hat
+    case 't': case 'T': nouveau = BAT_TOM;   break;
+    case ' ': case CORRECTION: nouveau = BAT_VIDE; break;
+    default: return;                                     // touche sans effet
+  }
+  if (nouveau != ancien) {
+    batterie[b][curPas] = nouveau;
+    afficherCase(curPas, curPiste);
+    marquerModifie();
+  }
+  if (nouveau != BAT_VIDE && !lecture) declencherBatterie(nouveau, volumeBatterie[b]);   // ecoute
+}
+
 // Traite une touche d'edition sur l'ecran de la grille.
 void toucheEdition(unsigned long touche) {
+  bool surBatterie = (curPiste >= COL_BATTERIE);
+
   // Volume de la piste sous le curseur
   if (touche == '+' || touche == '-') {
-    uint8_t& n = niveauPiste[curPiste];
+    uint8_t& n = surBatterie ? niveauBatterie[curPiste - COL_BATTERIE] : niveauPiste[curPiste];
     if (touche == '+' && n < 9)      n++;
     else if (touche == '-' && n > 0) n--;
     else { minitel.bip(); return; }
@@ -564,6 +743,7 @@ void toucheEdition(unsigned long touche) {
 
   // Forme d'onde de la piste sous le curseur
   if (touche == '*') {
+    if (surBatterie) { minitel.bip(); return; }          // pas de forme d'onde
     formePiste[curPiste] = (formePiste[curPiste] + 1) % NB_ONDES;
     afficherLigneEtat();
     marquerModifie();
@@ -572,8 +752,10 @@ void toucheEdition(unsigned long touche) {
     return;
   }
 
+  if (surBatterie && !estFleche(touche)) { toucheBatterie(touche); return; }
+
   int ancienPas = curPas, anciennePiste = curPiste;
-  uint8_t note = grille[curPas][curPiste];
+  uint8_t note = surBatterie ? 0 : grille[curPas][curPiste];
   int nouvelle = note;          // -1 = pas de changement de note
   bool noteSaisie = false;
 
@@ -581,8 +763,8 @@ void toucheEdition(unsigned long touche) {
   // selon le mode du clavier.
   if      (touche == TOUCHE_FLECHE_HAUT   || touche == 0x0B) curPas   = (curPas + NB_PAS - 1) % NB_PAS;
   else if (touche == TOUCHE_FLECHE_BAS    || touche == 0x0A) curPas   = (curPas + 1) % NB_PAS;
-  else if (touche == TOUCHE_FLECHE_GAUCHE || touche == 0x08) curPiste = (curPiste + NB_PISTES - 1) % NB_PISTES;
-  else if (touche == TOUCHE_FLECHE_DROITE || touche == 0x09) curPiste = (curPiste + 1) % NB_PISTES;
+  else if (touche == TOUCHE_FLECHE_GAUCHE || touche == 0x08) curPiste = (curPiste + NB_COLONNES - 1) % NB_COLONNES;
+  else if (touche == TOUCHE_FLECHE_DROITE || touche == 0x09) curPiste = (curPiste + 1) % NB_COLONNES;
   else if (touche == ' ' || touche == CORRECTION) {
     nouvelle = 0;
   }
@@ -597,7 +779,7 @@ void toucheEdition(unsigned long touche) {
   else if (touche >= '1' && touche <= '7') {
     octaveCourante = touche - '0';
     if (note != 0) nouvelle = (octaveCourante + 1) * 12 + note % 12;
-    afficherLigneEtat();
+    afficherBandeauGrille();
     noteSaisie = true;
   }
   else {
@@ -625,6 +807,7 @@ void toucheEdition(unsigned long touche) {
 void viderGrille() {
   for (int pas = 0; pas < NB_PAS; pas++)
     for (int p = 0; p < NB_PISTES; p++) grille[pas][p] = 0;
+  for (int pas = 0; pas < NB_PAS; pas++) batterie[0][pas] = batterie[1][pas] = BAT_VIDE;
   marquerModifie();
   for (int pas = 0; pas < NB_PAS; pas++) afficherLignePas(pas);
 }
@@ -645,8 +828,18 @@ void lireEmplacements() {
   for (int n = 1; n <= NB_EMPLACEMENTS; n++) {
     char cle[4];
     snprintf(cle, sizeof(cle), "b%d", n);
-    occupe[n - 1] = prefs.getBytesLength(cle) == sizeof(Boucle);
-    if (occupe[n - 1]) prefs.getBytes(cle, &emplacements[n - 1], sizeof(Boucle));
+    size_t taille = prefs.getBytesLength(cle);
+    occupe[n - 1] = (taille == sizeof(Boucle) || taille == TAILLE_BOUCLE_V2 ||
+                     taille == TAILLE_BOUCLE_V1);
+    if (!occupe[n - 1]) continue;
+    memset(&emplacements[n - 1], 0, sizeof(Boucle));
+    prefs.getBytes(cle, &emplacements[n - 1], taille);
+    Boucle& b = emplacements[n - 1];
+    if (taille == TAILLE_BOUCLE_V1) b.volumeBatterie = 6;       // format sans batterie
+    if (taille != sizeof(Boucle)) {                             // formats sans piste D2
+      memset(b.batterie2, 0, sizeof(b.batterie2));
+      b.volumeBatterie2 = 6;
+    }
   }
 }
 
@@ -660,6 +853,7 @@ bool sauverDansEmplacement(int n) {
   bool vide = true;
   for (int pas = 0; pas < NB_PAS && vide; pas++)
     for (int p = 0; p < NB_PISTES; p++) if (grille[pas][p]) { vide = false; break; }
+  for (int pas = 0; pas < NB_PAS; pas++) if (batterie[0][pas] || batterie[1][pas]) vide = false;
 
   if (vide) {
     if (occupe[n - 1]) prefs.remove(cle);
@@ -701,6 +895,7 @@ void chargerMotif() {
   if (prefs.getBytesLength("grille") == sizeof(copie)) {
     prefs.getBytes("grille", copie, sizeof(copie));
     memcpy((void*)grille, copie, sizeof(copie));
+    for (int pas = 0; pas < NB_PAS; pas++) batterie[0][pas] = batterie[1][pas] = BAT_VIDE;   // pas de batterie a l'epoque
   }
   uint16_t t = prefs.getUShort("tempo", 120);
   tempoBpm = (t >= 60 && t <= 200) ? t : 120;
@@ -823,7 +1018,7 @@ void setup() {
   }
 
   Serial.println();
-  Serial.println("=== Sequenceur Minitel -> Bluetooth ===");
+  Serial.println("=== Minitracker ===");
   Serial.printf("Enceinte memorisee : %s\n", reconnexion ? nomChoisi : "aucune");
   Serial.printf("Vitesse du Minitel : %d bauds\n", vitesseMinitel);
 
@@ -905,7 +1100,8 @@ void loop() {
     Serial.printf("Touche 0x%lX", touche);
     if (touche >= 32 && touche < 127) Serial.printf(" '%c'", (char)touche);
     Serial.printf("  (case pas %d, piste %d, note MIDI %d)\n",
-                  curPas + 1, curPiste + 1, grille[curPas][curPiste]);
+                  curPas + 1, curPiste + 1,
+                  curPiste < NB_PISTES ? grille[curPas][curPiste] : batterie[curPiste - COL_BATTERIE][curPas]);
 #endif
     switch (ecran) {
 
